@@ -1,188 +1,180 @@
-# import socket
-# import re
-
-# # ASTM protocol control characters
-# ENQ = b'\x05'
-# ACK = b'\x06'
-# STX = b'\x02'
-# ETX = b'\x03'
-# EOT = b'\x04'
-
-# HOST = '0.0.0.0'
-# PORT = 8000
-
-# def parse_astm_frame(frame_text):
-#     """Parses ASTM frame and extracts results from R| lines."""
-#     lines = frame_text.strip().split('\r')
-#     sample_id = None
-#     results = []
-
-#     for line in lines:
-#         if line.startswith('P|'):
-#             parts = line.split('|')
-#             sample_id = parts[2] if len(parts) > 2 else 'UNKNOWN'
-
-#         elif line.startswith('R|'):
-#             parts = line.split('|')
-#             if len(parts) >= 4:
-#                 test_name = parts[2]  # e.g., GLU, UREA
-#                 result_value = parts[3]
-#                 results.append((test_name, result_value))
-
-#     return sample_id, results
-
-# def handle_astm_connection(conn):
-#     buffer = b''
-
-#     while True:
-#         data = conn.recv(1024)
-#         if not data:
-#             break
-
-#         if ENQ in data:
-#             print("📥 [ENQ] Received — Sending ACK")
-#             conn.sendall(ACK)
-
-#         elif STX in data and ETX in data:
-#             frame = data[data.find(STX)+1 : data.find(ETX)]  # Trim STX/ETX
-#             try:
-#                 text = frame.decode('ascii', errors='ignore')
-#                 print("📥 Frame:\n", text.strip())
-
-#                 # Parse results
-#                 sample_id, results = parse_astm_frame(text)
-#                 print(f"🧪 Sample ID: {sample_id}")
-#                 for test, value in results:
-#                     print(f"➡️ {test}: {value}")
-
-#                 conn.sendall(ACK)
-#             except Exception as e:
-#                 print("❌ Decode error:", e)
-
-#         elif EOT in data:
-#             print("📴 [EOT] End of transmission")
-#             break
-
-#         else:
-#             print("📥 Raw bytes:", data)
-#             print("📥 Hex     :", data.hex())
-
-#     conn.close()
-
-# # Main server loop
-# with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-#     s.bind((HOST, PORT))
-#     s.listen(1)
-#     print(f"🟢 Waiting for EC90 connection on port {PORT}...")
-
-#     conn, addr = s.accept()
-#     print(f"🔗 Connected from {addr}")
-#     handle_astm_connection(conn)
 import socket
+import logging
+import mysql.connector
 
-# ASTM protocol control characters
+# ------------------ Logging Setup ------------------
+logging.basicConfig(
+    filename="ec90_tcp_log.txt",
+    level=logging.INFO,
+    format="%(asctime)s - %(message)s",
+    encoding="utf-8"
+)
+log = logging.getLogger()
+
+# ------------------ ASTM Control Characters ------------------
 ENQ = b'\x05'
 ACK = b'\x06'
 STX = b'\x02'
 ETX = b'\x03'
 EOT = b'\x04'
 
+# ------------------ Network Config ------------------
 HOST = '0.0.0.0'
 PORT = 8000
 
-# Normal reference ranges
-ref_ranges = {
-    "Na": (135.0, 145.0),
-    "K": (3.50, 5.10),
-    "Cl": (98.0, 107.0),
-}
+# ------------------ Checksum Function ------------------
+def calculate_checksum(data: bytes):
+    total = sum(data + ETX)
+    return f"{total & 0xFF:02X}"
 
-# Full test names
-test_names = {
-    "Na": "Sodium",
-    "K": "Potassium",
-    "Cl": "Chloride",
-}
-
-def interpret_result(code, value):
-    try:
-        val = float(value)
-        low, high = ref_ranges.get(code, (None, None))
-        if low is not None and high is not None:
-            if val < low:
-                return f"{val} ⬇️ [Low]"
-            elif val > high:
-                return f"{val} ⬆️ [High]"
-            else:
-                return f"{val} ✅ [Normal]"
-        return value
-    except:
-        return value
-
-def parse_astm_frame(frame_text):
-    lines = frame_text.strip().split('\r')
+# ------------------ Parse Records ------------------
+def parse_records(lines):
     sample_id = None
-    results = []
+    results = {}
 
     for line in lines:
-        if line.startswith('P|'):
-            parts = line.split('|')
-            sample_id = parts[2] if len(parts) > 2 else 'UNKNOWN'
-
-        elif line.startswith('R|'):
-            parts = line.split('|')
-            if len(parts) >= 4:
-                raw_code = parts[2]
-                test_code = raw_code.split('^')[-1]  # Extract Na from ^^Na
-                result_value = parts[3]
-                results.append((test_code, result_value))
+        parts = line.split('|')
+        if line.startswith('P|') and len(parts) > 2:
+            sample_id = parts[2]
+        elif line.startswith('R|') and len(parts) > 4:
+            sample_id = parts[3]
+        elif line.startswith('X|') and len(parts) > 6:
+            code = parts[4].strip()
+            value = parts[5].strip()
+            results[code] = value
 
     return sample_id, results
 
-def handle_astm_connection(conn):
+# ------------------ Process Frames ------------------
+def process_buffer(buffered_lines):
+    records = []
+    for raw_line in buffered_lines:
+        if not (raw_line.startswith(STX) and ETX in raw_line):
+            continue
+
+        stx = raw_line.find(STX) + 1
+        etx = raw_line.find(ETX)
+        frame_data = raw_line[stx:etx]
+        recv_cksum = raw_line[etx+1:etx+3].decode(errors='ignore').upper()
+        calc_cksum = calculate_checksum(frame_data)
+
+        if recv_cksum != calc_cksum:
+            log.warning(f"❌ Checksum mismatch: got {recv_cksum}, expected {calc_cksum}")
+            continue
+
+        decoded = frame_data.decode(errors='ignore').strip()
+
+        if '|' in decoded:
+            parts = decoded.split('|', 1)
+            if parts[0][-1].isalpha():
+                decoded = parts[0][-1] + '|' + parts[1]
+            else:
+                decoded = parts[1]
+
+        log.info(f"📄 Raw Frame: {decoded}")
+        with open("frames.txt", "a", encoding="utf-8") as f:
+            f.write(decoded + "\n")
+
+        records.append(decoded)
+
+    return records
+
+# ------------------ MySQL Insert ------------------
+def insert_to_mysql(sample_id, results):
+    try:
+        conn = mysql.connector.connect(
+            host='192.168.20.160',
+            user='remoteapi',
+            password='kmc@123',
+            database='kmc_05_06_2025_server'
+        )
+        cursor = conn.cursor()
+        cursor.execute("SELECT MAX(LIS_ID) FROM lis_machineresult")
+        max_id = cursor.fetchone()[0] or 0
+        next_id = max_id + 1
+
+        for test in ['Na', 'K', 'Cl']:
+            value = results.get(test)
+            if value:
+                cursor.execute("""
+                    INSERT INTO lis_machineresult (
+                        LIS_ID, LIS_MACHNAME, LIS_MACHID, LIS_LABID,
+                        LIS_MACHTESTID, LIS_MACHRESULTS, LIS_RPREVIEW
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    next_id, "ELECTROLYTE ANALYZER", "EC 90", sample_id,
+                    test, value, 0
+                ))
+                log.info(f"✅ DB Insert: {sample_id} - {test} = {value}")
+                next_id += 1
+
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.error(f"❌ MySQL Error: {e}")
+
+# ------------------ TCP Data Handler ------------------
+def handle_tcp_connection(conn):
+    print("📡 Connected")
+    log.info("📡 Connected")
+    temp_frame = b''
+    buffered_lines = []
+    receiving = False
+
     while True:
         data = conn.recv(1024)
         if not data:
             break
 
         if ENQ in data:
-            print("📥 [ENQ] Received — Sending ACK")
+            print("🔔 ENQ received — sending ACK")
+            log.info("🔔 ENQ received — sending ACK")
             conn.sendall(ACK)
+            buffered_lines = []
+            receiving = True
+            continue
 
-        elif STX in data and ETX in data:
-            frame = data[data.find(STX)+1 : data.find(ETX)]  # Trim STX/ETX
-            try:
-                text = frame.decode('ascii', errors='ignore')
-                print("📥 Frame:\n", text.strip())
+        if EOT in data:
+            print("✅ EOT received — processing data")
+            log.info("✅ EOT received — processing data")
+            records = process_buffer(buffered_lines)
+            sample_id, results = parse_records(records)
 
-                sample_id, results = parse_astm_frame(text)
-                print(f"\n🧪 Sample ID: {sample_id}")
-                for code, value in results:
-                    test_name = test_names.get(code, code)
-                    formatted = interpret_result(code, value)
-                    print(f"📊 {test_name:10}: {formatted}")
-                print()
-                conn.sendall(ACK)
+            print(f"\n🧾 Sample ID: {sample_id}")
+            log.info(f"🧾 Sample ID: {sample_id}")
 
-            except Exception as e:
-                print("❌ Decode error:", e)
+            for test in ['Na', 'K', 'Cl']:
+                value = results.get(test)
+                print(f"🧪 {test}: {value if value else '❌ Not found'}")
+                log.info(f"🧪 {test}: {value if value else '❌ Not found'}")
 
-        elif EOT in data:
-            print("📴 [EOT] End of transmission")
+            if sample_id:
+                insert_to_mysql(sample_id, results)
+
+            conn.sendall(ACK)
+            receiving = False
             break
 
-        else:
-            print("📥 Raw bytes:", data)
-            print("📥 Hex     :", data.hex())
+        if receiving:
+            temp_frame += data
+            while b'\n' in temp_frame:
+                line, temp_frame = temp_frame.split(b'\n', 1)
+                buffered_lines.append(line.strip())
+                conn.sendall(ACK)
 
     conn.close()
+    print("🔌 TCP connection closed")
+    log.info("🔌 TCP connection closed\n")
 
-# Main server loop
+# ------------------ TCP Server Main ------------------
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
     s.bind((HOST, PORT))
     s.listen(1)
-    print(f"🟢 Waiting for EC90 connection on port {PORT}...")
+    print(f"🟢 Listening for EC90 on port {PORT}...")
+    log.info(f"🟢 Listening for EC90 on port {PORT}...")
 
-    conn, addr = s.accept()
-    print(f"🔗 Connected from {addr}")
-    handle_astm_connection(conn)
+    while True:
+        conn, addr = s.accept()
+        print(f"🔗 Connected from {addr}")
+        log.info(f"🔗 Connected from {addr}")
+        handle_tcp_connection(conn)
